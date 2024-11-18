@@ -1898,7 +1898,7 @@ app.post("/submit-payment", paymentValidationRules, async (req, res) => {
     hidden: true,
   };
 
-  const userAddress = `${paymentData.address1}, ${paymentData.city}, ${paymentData.zip}`;
+  const userAddress = `${paymentData.address1}, ${paymentData.zip}, ${paymentData.city}`;
 
   // Construct the update object conditionally
   const updateData = {
@@ -2057,16 +2057,6 @@ app.post("/payment-notification", async (req, res) => {
       const now = new Date();
       let expiryDate;
 
-      if (translationData.depolamaOpt) {
-        // If depolamaOpt exists, add that many months
-        expiryDate = new Date(
-          now.setMonth(now.getMonth() + Number(translationData.depolamaOpt))
-        );
-      } else {
-        // If depolamaOpt does not exist, set expiryDate to 7 days from now
-        expiryDate = new Date(now.setDate(now.getDate() + 7));
-      }
-
       const paidAmount =
         isPesin && isFirstPayment
           ? finalamount
@@ -2109,7 +2099,7 @@ app.post("/payment-notification", async (req, res) => {
             "payments.0.amount": paidAmount,
             "payments.0.status": "paid",
             "payments.0.timestamp": admin.firestore.Timestamp.now(),
-            expiryDate: admin.firestore.Timestamp.fromDate(expiryDate), // Set expiry date
+            //expiryDate: admin.firestore.Timestamp.fromDate(expiryDate), // Set expiry date
             status: "translatortranslating",
             waitingTranslatorTranslatingStartedAt:
               admin.firestore.Timestamp.now(),
@@ -2127,6 +2117,20 @@ app.post("/payment-notification", async (req, res) => {
           );
         } else {
           console.log("Payment: second");
+
+          const now = new Date();
+          let expiryDate;
+
+          if (translationData.depolamaOpt) {
+            // If depolamaOpt exists, add that many months
+            expiryDate = new Date(
+              now.setMonth(now.getMonth() + Number(translationData.depolamaOpt))
+            );
+          } else {
+            // If depolamaOpt does not exist, set expiryDate to 7 days from now
+            expiryDate = new Date(now.setDate(now.getDate() + 7));
+          }
+
           await translationRef.update({
             "payments.1.amount": paidAmount,
             "payments.1.status": "paid",
@@ -2277,7 +2281,6 @@ app.post("/goToPayment", async (req, res) => {
     }
 
     const translationData = translationdoc.data();
-    finalamount = translationData.finalamount;
 
     if (!translationData.userUID || translationData.userUID.id !== userUID) {
       console.log(
@@ -2365,7 +2368,8 @@ app.post("/goToPayment", async (req, res) => {
 
     const KDV = 0.2;
 
-    const calculatedRawPrice = finalamount + acilPrice + depolamaPrice;
+    const calculatedRawPrice =
+      translationData.karakterUcreti + acilPrice + depolamaPrice;
 
     let calculatedDiscountAmount = 0;
 
@@ -2392,9 +2396,11 @@ app.post("/goToPayment", async (req, res) => {
     );
 
     const calculatedTotalPrice =
-      calculatedDiscountedPrice + calculatedTaxAmount;
+      calculatedDiscountedPrice +
+      calculatedTaxAmount +
+      translationData.toplamOnayUcreti;
     console.log(
-      `Total Price (discountedPrice + taxAmount): ${calculatedDiscountedPrice} + ${calculatedTaxAmount} = ${calculatedTotalPrice}`
+      `Total Price (discountedPrice + taxAmount + toplam onay ücreti): ${calculatedDiscountedPrice} + ${calculatedTaxAmount} + ${translationData.toplamOnayUcreti} = ${calculatedTotalPrice}`
     );
 
     // Add the final history entry
@@ -2407,6 +2413,8 @@ app.post("/goToPayment", async (req, res) => {
     });
 
     const updateData = {
+      KDVUcreti: calculatedTaxAmount,
+      indirimTutari: calculatedDiscountAmount,
       finalamount: parseFloat(calculatedTotalPrice.toFixed(2)),
       //waitingTranslationStartedAt: admin.firestore.Timestamp.now(),
       history: admin.firestore.FieldValue.arrayUnion(...newHistoryEntries),
@@ -2446,6 +2454,430 @@ app.post("/goToPayment", async (req, res) => {
   } catch (error) {
     console.log(`Unexpected error: ${error.message}`);
     res.status(500).send("Beklenmeyen bir hata oluştu.");
+  }
+});
+
+//new reoffer
+app.post("/recalculate", async (req, res) => {
+  try {
+    const recalculateData = {
+      translationID: req.body.translationID,
+      translationName: req.body.translationName,
+      spesifikOnay: req.body.spesifikOnay,
+      noterOnay: req.body.noterOnay,
+      apostilleOnay: req.body.apostilleOnay,
+      kaymakamValilikOnay: req.body.kaymakamValilikOnay,
+      disisleriOnay: req.body.disisleriOnay,
+      elcilikKonsoloslukOnay: req.body.elcilikKonsoloslukOnay,
+      almanyaOnay: req.body.almanyaOnay,
+      adliBilirKisiOnay: req.body.adliBilirKisiOnay,
+      targetLanguage: req.body.targetLanguage,
+      language: req.body.detectedLanguage,
+    };
+
+    console.log("Translation ID: ", recalculateData.translationID);
+
+    const translationdocRef = db
+      .collection("translations")
+      .doc(recalculateData.translationID);
+
+    // Fetch the translation document
+    const translationdoc = await translationdocRef.get();
+
+    if (!translationdoc.exists) {
+      res.status(404).send("Veritabanı hatası. Çeviri bulunamadı.");
+      return;
+    }
+
+    const translationdata = translationdoc.data();
+
+    const userdocRef = db.collection("users").doc(translationdata.userUID.id);
+
+    const userdoc = await userdocRef.get();
+
+    if (!userdoc.exists) {
+      res.status(404).send("Veritabanı hatası. Böyle bir kullanıcı yok.");
+      return;
+    }
+
+    const userdata = userdoc.data();
+
+    const discount = userdata.discount || 0;
+
+    // Normalize language codes
+    const normalizeLanguageCode = (lang) => {
+      const codeMap = {
+        gb: "en",
+        ir: "fa",
+        be: "fl",
+        dk: "da",
+        se: "sv",
+        rs: "sr",
+        tm: "tk",
+        si: "sl",
+        il: "he",
+      };
+      return codeMap[lang] || lang;
+    };
+
+    // Apply normalization to both original and target languages
+    const originalLang = normalizeLanguageCode(recalculateData.language);
+    const targetLanguage = normalizeLanguageCode(
+      recalculateData.targetLanguage
+    );
+
+    // Check for changes in fields that affect pricing
+    const fieldsToCompare = [
+      "spesifikOnay",
+      "noterOnay",
+      "apostilleOnay",
+      "kaymakamValilikOnay",
+      "disisleriOnay",
+      "elcilikKonsoloslukOnay",
+      "almanyaOnay",
+      "adliBilirKisiOnay",
+      "targetLanguage",
+    ];
+
+    let changesDetected = false;
+
+    for (const field of fieldsToCompare) {
+      const newValue = recalculateData[field];
+      const oldValue = translationdata[field];
+
+      if (newValue !== oldValue) {
+        changesDetected = true;
+        break;
+      }
+    }
+
+    if (!changesDetected) {
+      res.status(200).json({
+        message: "No changes detected. Recalculation not necessary.",
+      });
+      return;
+    }
+
+    const files = translationdata.files;
+
+    // Calculate total character count
+    let totalCharCount = 0;
+    Object.keys(files).forEach((fileKey) => {
+      const fileData = files[fileKey].textData;
+      totalCharCount += fileData.charCountWithoutSpacesAndNumbers;
+    });
+
+    const spesifikPrefix = recalculateData.spesifikOnay ? "-S" : "";
+
+    // Fetch birim fiyat
+    const birimcode1 = `${originalLang}-${targetLanguage}${spesifikPrefix}`;
+    const birimcode2 = `${targetLanguage}-${originalLang}${spesifikPrefix}`;
+
+    const birimdocRef = db.collection("fiyatlar").doc("birimfiyatlari");
+    const birimdoc = await birimdocRef.get();
+
+    if (!birimdoc.exists) {
+      res.status(404).send("Veritabanı hatası. Birim fiyatlara ulaşılamıyor.");
+      return;
+    }
+
+    const birimdata = birimdoc.data();
+
+    let birimfiyat;
+    let usedcode;
+
+    if (birimcode1 in birimdata) {
+      birimfiyat = birimdata[birimcode1];
+      console.log(`Value for ${birimcode1}:`, birimfiyat);
+      usedcode = birimcode1;
+    } else if (birimcode2 in birimdata) {
+      birimfiyat = birimdata[birimcode2];
+      console.log(`Value for ${birimcode2}:`, birimfiyat);
+      usedcode = birimcode2;
+    } else {
+      console.log(
+        `Neither field ${birimcode1} nor ${birimcode2} exists in the document.`
+      );
+      res.status(404).send("From/To language bulunamadı hatası.");
+      return;
+    }
+
+    // Fix totalCharCount to 1000 if less than 1000
+    const realTotalCharCount = totalCharCount;
+    if (totalCharCount < 1000) {
+      totalCharCount = 1000;
+    }
+
+    // Calculate karakter ücreti
+    const karakterUcreti = totalCharCount * birimfiyat;
+
+    console.log(
+      `Karakter Ücreti : (toplam karakter sayısı) ${totalCharCount} x (${usedcode} birim fiyatı) ${birimfiyat} = ${karakterUcreti.toFixed(
+        2
+      )}`
+    );
+
+    // Fetch onay prices
+    const onaydocRef = db.collection("fiyatlar").doc("onayfiyatlari");
+    const onaydoc = await onaydocRef.get();
+
+    if (!onaydoc.exists) {
+      res.status(404).send("Veritabanı hatası. Onay Fiyatlarına ulaşılamıyor.");
+      return;
+    }
+
+    const onaydata = onaydoc.data();
+
+    const apostilleOnayFiyat = onaydata.apostilleOnay;
+    const kaymakamValilikFiyat = onaydata.kaymakamValilikOnay;
+    const disisleriFiyat = onaydata.disisleriOnay;
+    const elcilikKonsoloslukFiyat = onaydata.elcilikKonsoloslukOnay;
+    const almanyaFiyat = onaydata.almanyaOnay;
+    const adliBilirKisiFiyat = onaydata.adliBilirKisiOnay * 33; // Multiply by current Euro rate
+    const noterbirimFiyat = onaydata.noterbirim;
+    const notersabitFiyat = onaydata.notersabit;
+
+    // Calculate onay prices
+    let toplamOnayUcreti = 0;
+    let feeDescriptions = [];
+    let onaylar = {};
+    let clientOnaylar = {};
+
+    // Calculate noter price
+    let noterUcreti = 0;
+
+    if (recalculateData.noterOnay) {
+      noterUcreti = notersabitFiyat + totalCharCount * noterbirimFiyat;
+
+      console.log(
+        `Noter Ücreti : (Noter Sabit Fiyat) ${notersabitFiyat} + ((toplam karakter sayısı) ${totalCharCount} x (Noter Birim Fiyat) ${noterbirimFiyat}) = ${noterUcreti.toFixed(
+          2
+        )}`
+      );
+      onaylar["noterOnay"] = noterUcreti;
+      clientOnaylar["Noter Onayı*: "] = noterUcreti;
+    }
+
+    if (recalculateData.apostilleOnay) {
+      toplamOnayUcreti += apostilleOnayFiyat;
+      feeDescriptions.push(`(Apostille Onay) ${apostilleOnayFiyat}`);
+      onaylar["apostilleOnay"] = apostilleOnayFiyat;
+      clientOnaylar["Apostille Onayı: "] = apostilleOnayFiyat;
+    }
+    if (recalculateData.kaymakamValilikOnay) {
+      toplamOnayUcreti += kaymakamValilikFiyat;
+      feeDescriptions.push(`(Kaymakam Valilik Onay) ${kaymakamValilikFiyat}`);
+      onaylar["kaymakamValilikOnay"] = kaymakamValilikFiyat;
+      clientOnaylar["Kaymakam Valilik Onayı: "] = kaymakamValilikFiyat;
+    }
+    if (recalculateData.disisleriOnay) {
+      toplamOnayUcreti += disisleriFiyat;
+      feeDescriptions.push(`(Dışişleri Onay) ${disisleriFiyat}`);
+      onaylar["disisleriOnay"] = disisleriFiyat;
+      clientOnaylar["Dışişleri Onayı: "] = disisleriFiyat;
+    }
+    if (recalculateData.elcilikKonsoloslukOnay) {
+      toplamOnayUcreti += elcilikKonsoloslukFiyat;
+      feeDescriptions.push(
+        `(Elçilik Konsolosluk Onay) ${elcilikKonsoloslukFiyat}`
+      );
+      onaylar["elcilikKonsoloslukOnay"] = elcilikKonsoloslukFiyat;
+      clientOnaylar["Elçilik Konsolosluk Onayı: "] = elcilikKonsoloslukFiyat;
+    }
+    if (recalculateData.almanyaOnay) {
+      toplamOnayUcreti += almanyaFiyat;
+      feeDescriptions.push(`(Almanya Onay) ${almanyaFiyat}`);
+      onaylar["almanyaOnay"] = almanyaFiyat;
+      clientOnaylar["Almanya Onayı: "] = almanyaFiyat;
+    }
+    if (recalculateData.adliBilirKisiOnay) {
+      toplamOnayUcreti += adliBilirKisiFiyat;
+      feeDescriptions.push(`(Adli Bilirkişi Onay) ${adliBilirKisiFiyat}`);
+      onaylar["adliBilirKisiOnay"] = adliBilirKisiFiyat;
+      clientOnaylar["Adli Bilirkişi Onayı: "] = adliBilirKisiFiyat;
+    }
+
+    console.log(
+      "Onay Ücretleri: " +
+        feeDescriptions.join(" + ") +
+        ` = ${toplamOnayUcreti}`
+    );
+
+    // Calculate discount and KDV
+    const KDV = 0.2;
+    let indirimTutari = 0;
+
+    if (discount > 0) {
+      indirimTutari = karakterUcreti * (discount / 100);
+    }
+
+    const KDVUcreti = (karakterUcreti - indirimTutari) * KDV;
+
+    let finalamount =
+      karakterUcreti + toplamOnayUcreti + KDVUcreti - indirimTutari;
+
+    console.log(
+      `(Karakter Ücreti): ${karakterUcreti.toFixed(
+        2
+      )}, (Noter Ücreti): ${noterUcreti.toFixed(
+        2
+      )}, (Onay Ücretleri): ${toplamOnayUcreti.toFixed(2)}`
+    );
+
+    finalamount = parseFloat(finalamount.toFixed(2));
+
+    // Create history entry in Turkish
+    let historyDescription = `Çeviri güncellendi. Yeni fiyat: ${finalamount} TL. `;
+    historyDescription += `Karakter Ücreti: ${karakterUcreti.toFixed(2)} TL, `;
+    if (noterUcreti > 0) {
+      historyDescription += `Noter Ücreti: ${noterUcreti.toFixed(2)} TL, `;
+    }
+    if (toplamOnayUcreti > 0) {
+      historyDescription += `Onay Ücretleri: ${toplamOnayUcreti.toFixed(
+        2
+      )} TL, `;
+    }
+    if (indirimTutari > 0) {
+      historyDescription += `İndirim Tutarı (${discount}%): ${indirimTutari.toFixed(
+        2
+      )} TL, `;
+    }
+    historyDescription += `KDV (%${KDV * 100}): ${KDVUcreti.toFixed(2)} TL.`;
+
+    const newHistoryEntry = {
+      timestamp: admin.firestore.Timestamp.now(),
+      description: historyDescription,
+      hidden: false,
+    };
+
+    // Update the translation document
+    await translationdocRef.update({
+      translationName: recalculateData.translationName,
+      discount: discount,
+      onaylar: onaylar,
+      finalamount: finalamount,
+      karakterUcreti: parseFloat(karakterUcreti.toFixed(2)),
+      noterUcreti: parseFloat(noterUcreti.toFixed(2)),
+      toplamOnayUcreti: parseFloat(toplamOnayUcreti.toFixed(2)),
+      KDVUcreti: parseFloat(KDVUcreti.toFixed(2)),
+      indirimTutari: parseFloat(indirimTutari.toFixed(2)),
+      clientOnaylar: clientOnaylar,
+      targetLanguage: targetLanguage,
+      language: originalLang,
+      history: admin.firestore.FieldValue.arrayUnion(newHistoryEntry),
+      //approved: false, // Since this is just recalculating, not approving
+    });
+
+    // Send the data as response
+    res.status(200).json({
+      discount: discount,
+      finalamount: finalamount,
+      karakterUcreti: parseFloat(karakterUcreti.toFixed(2)),
+      noterUcreti: parseFloat(noterUcreti.toFixed(2)),
+      toplamOnayUcreti: parseFloat(toplamOnayUcreti.toFixed(2)),
+      KDVUcreti: parseFloat(KDVUcreti.toFixed(2)),
+      indirimTutari: parseFloat(indirimTutari.toFixed(2)),
+      clientOnaylar: clientOnaylar,
+      translationID: recalculateData.translationID,
+    });
+  } catch (error) {
+    console.error("Error in recalculate endpoint:", error);
+    res.status(500).send("Internal Server Error");
+  }
+});
+
+app.post("/approveTranslation", async (req, res) => {
+  try {
+    const approvalData = {
+      translationID: req.body.translationID,
+      reOfferTranslatorName: req.body.reOfferTranslatorName,
+    };
+
+    console.log("Translation ID: ", approvalData.translationID);
+
+    const translationdocRef = db
+      .collection("translations")
+      .doc(approvalData.translationID);
+
+    // Fetch the translation document
+    const translationdoc = await translationdocRef.get();
+
+    if (!translationdoc.exists) {
+      res.status(404).send("Veritabanı hatası. Çeviri bulunamadı.");
+      return;
+    }
+
+    const translationdata = translationdoc.data();
+
+    const userdocRef = db.collection("users").doc(translationdata.userUID.id);
+
+    const userdoc = await userdocRef.get();
+
+    if (!userdoc.exists) {
+      res.status(404).send("Veritabanı hatası. Böyle bir kullanıcı yok.");
+      return;
+    }
+
+    const userdata = userdoc.data();
+
+    const userEmail = userdata.email;
+    const userName = userdata.name;
+    const userSurname = userdata.surname;
+    const userPhone = userdata.phone;
+
+    const newStatus = "waitinguserfirstpayment";
+
+    console.log(`${approvalData.reOfferTranslatorName} teklifi onayladı.`);
+
+    const historyEntry = {
+      timestamp: admin.firestore.Timestamp.now(),
+      description: `${approvalData.reOfferTranslatorName} teklifi onayladı.`,
+      hidden: false,
+    };
+
+    // Create a custom token for the user (if needed)
+    const customToken = await admin
+      .auth()
+      .createCustomToken(translationdata.userUID.id);
+
+    // Send email notification to the user
+    try {
+      await sendTeklifOnayMail(
+        approvalData.translationID,
+        translationdata.finalamount,
+        userEmail,
+        customToken
+      );
+      console.log(
+        "Email notification sent successfully from approveTranslation."
+      );
+    } catch (error) {
+      console.error(
+        "Failed to send email notification from approveTranslation:",
+        error
+      );
+      res.status(500).json({
+        error: "Mail error",
+      });
+      return;
+    }
+
+    // Update the translation document
+    await translationdocRef.update({
+      status: newStatus,
+      waitingUserFirstPaymentStartedAt: admin.firestore.Timestamp.now(),
+      history: admin.firestore.FieldValue.arrayUnion(historyEntry),
+      approved: true,
+    });
+
+    // Send the data as response
+    res.status(200).json({
+      translationID: approvalData.translationID,
+      message: "Translation approved successfully.",
+    });
+  } catch (error) {
+    console.error("Error in approveTranslation endpoint:", error);
+    res.status(500).send("Internal Server Error");
   }
 });
 
@@ -3035,11 +3467,69 @@ app.post("/updateNoterPrice", async (req, res) => {
     await translationRef.update({
       noterUcreti,
       onaylar,
+      noterStatus: "Ücret müşteriye bildirildi",
       history: admin.firestore.FieldValue.arrayUnion(newHistoryEntry),
     });
 
     console.log(`Belge başarıyla güncellendi: translationID ${translationID}`);
     return res.status(200).send("Belge başarıyla güncellendi.");
+  } catch (error) {
+    console.error("Bilinmeyen bir hata oluştu:", error);
+    return res
+      .status(500)
+      .send("Sunucu hatası. Lütfen daha sonra tekrar deneyiniz.");
+  }
+});
+
+app.post("/setNoterAsPaid", async (req, res) => {
+  try {
+    // HTTP method check
+    if (req.method !== "POST") {
+      console.error("Geçersiz istek yöntemi kullanıldı.");
+      return res.status(405).send("Sadece POST istekleri kabul edilir.");
+    }
+
+    // Extracting translationID from request body
+    const { translationID } = req.body;
+
+    // Input validation
+    if (!translationID) {
+      console.error("Eksik parametre: translationID gerekli.");
+      return res.status(400).send("translationID gereklidir.");
+    }
+
+    // Accessing the translation document
+    const translationRef = db.collection("translations").doc(translationID);
+    const doc = await translationRef.get();
+
+    if (!doc.exists) {
+      console.error(`Belge bulunamadı: translationID ${translationID}`);
+      return res.status(404).send("Belge bulunamadı.");
+    }
+
+    // Updating noterStatus to "Ödendi"
+    await translationRef.update({
+      noterStatus: "Ödendi",
+    });
+
+    // Creating history entry
+    const historyString = `Noter ücreti ödendi olarak işaretlendi.`;
+
+    console.log(historyString);
+
+    const newHistoryEntry = {
+      timestamp: admin.firestore.Timestamp.now(),
+      description: historyString,
+      hidden: false,
+    };
+
+    // Adding the history entry
+    await translationRef.update({
+      history: admin.firestore.FieldValue.arrayUnion(newHistoryEntry),
+    });
+
+    console.log(`Belge başarıyla güncellendi: translationID ${translationID}`);
+    return res.status(200).send("Noter durumu başarıyla güncellendi.");
   } catch (error) {
     console.error("Bilinmeyen bir hata oluştu:", error);
     return res
