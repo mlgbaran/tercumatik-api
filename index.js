@@ -714,33 +714,143 @@ function analyzePages(jsonData) {
   return pagesData;
 }
 
-const processImageWithTesseract = async (req, userUID, storageDir, bucket) => {
+const processImageWithTesseract = async (
+  file,
+  userUID,
+  storageDir,
+  bucket,
+  languageCode
+) => {
   try {
-    // Implement Tesseract OCR logic here
-    // Extract text and other data from the image
+    console.log("Starting OCR processing for image:", file.originalname);
 
-    const userLanguage = req.userLanguage;
+    const { createWorker } = require("tesseract.js");
 
-    const extractedText = "Extracted text from image"; // Placeholder for extracted text
+    // Map your application's language codes to Tesseract language codes
+    const tesseractLanguageMap = {
+      tr: "tur", // Turkish
+      en: "eng", // English
+      de: "deu", // German
+      fr: "fra", // French
+      az: "aze", // Azerbaijani
+      ru: "rus", // Russian
+      ua: "ukr", // Ukrainian
+      bg: "bul", // Bulgarian
+      sa: "ara", // Arabic
+      fa: "fas", // Farsi
+      it: "ita", // Italian
+      es: "spa", // Spanish
+      pt: "por", // Portuguese
+      nl: "nld", // Dutch
+      fl: "nld", // Flemish
+      no: "nor", // Norwegian
+      da: "dan", // Danish
+      sv: "swe", // Swedish
+      ge: "kat", // Georgian
+      fi: "fin", // Finnish
+      al: "sqi", // Albanian
+      sr: "srp", // Serbian
+      hr: "hrv", // Croatian
+      mk: "mkd", // Macedonian
+      tk: "tuk", // Turkmen
+      kz: "kaz", // Kazakh
+      kg: "kir", // Kyrgyz
+      uz: "uzb", // Uzbek
+      pl: "pol", // Polish
+      hu: "hun", // Hungarian
+      ro: "ron", // Romanian
+      cz: "ces", // Czech
+      sk: "slk", // Slovak
+      sl: "slv", // Slovene
+      cn: "chi_sim", // Chinese Simplified
+      jp: "jpn", // Japanese
+      kr: "kor", // Korean
+      gr: "ell", // Greek
+      he: "heb", // Hebrew
+      am: "hye", // Armenian
+    };
 
-    // Save the extracted text as a TXT file in Firebase Storage
-    const textFilePath = `${storageDir}/ExtractedText_${req.file.originalname}.txt`;
-    const textFile = bucket.file(textFilePath);
-    await textFile.save(extractedText.trim(), {
-      contentType: "text/plain",
+    // Get the Tesseract language code or default to English
+    const tesseractLangCode = tesseractLanguageMap[languageCode] || "eng";
+
+    console.log("Initializing Tesseract worker...");
+
+    // Create the worker with the language code and logger
+    const worker = await createWorker(tesseractLangCode, 1, {
+      logger: (m) => console.log(m), // Log progress
     });
 
-    // Return standardized values
-    return {
-      language: userLanguage, // Replace with actual detected language
-      pageCount: 1, // Image typically has only 1 "page"
-      zipFileUrl: null, // No ZIP for image extraction, so set this to null
-      textFilePath,
-      pagesData: [], // Pages data for image can be left empty or structured based on image metadata
+    console.log(
+      "Tesseract worker initialized with language:",
+      tesseractLangCode
+    );
+
+    // Perform OCR on the image buffer
+    console.log("Starting OCR recognition...");
+    const {
+      data: { text },
+    } = await worker.recognize(file.buffer);
+
+    console.log("OCR recognition completed.");
+
+    // Terminate the worker to free up resources
+    await worker.terminate();
+
+    console.log("Tesseract worker terminated.");
+
+    // Calculate character count without spaces and numbers
+    const charCountWithoutSpacesAndNumbers = text.replace(/\s|\d/g, "").length;
+
+    // Prepare text data
+    const textData = {
+      text: text.trim(),
+      charCountWithoutSpacesAndNumbers,
     };
+
+    // Define the path for the extracted text file
+    const textFilePath = `${storageDir}/ExtractedText_${file.originalname}.txt`;
+    const textFile = bucket.file(textFilePath);
+
+    console.log("Writing extracted text to Firebase Storage...");
+
+    // Create a write stream to save the extracted text
+    const textWriteStream = textFile.createWriteStream({
+      metadata: { contentType: "text/plain" },
+    });
+
+    // Write the extracted text to Firebase Storage
+    textWriteStream.end(textData.text);
+
+    return new Promise((resolve, reject) => {
+      textWriteStream.on("finish", async () => {
+        console.log("Extracted text file written successfully.");
+
+        const [metadata] = await textFile.getMetadata();
+        const textFileUrl = `https://storage.googleapis.com/${metadata.bucket}/${metadata.name}`;
+
+        // Images are considered as single-page documents
+        const pageCount = 1;
+
+        resolve({
+          textFilePath,
+          textFileUrl,
+          textData,
+          pageCount,
+          language: languageCode,
+        });
+      });
+
+      textWriteStream.on("error", (err) => {
+        console.error(
+          "Error writing extracted text file to Firebase Storage",
+          err
+        );
+        reject(new Error("Error writing extracted text file"));
+      });
+    });
   } catch (err) {
-    console.error("Error processing image with Tesseract:", err);
-    throw new Error("Error processing image with Tesseract");
+    console.error("Exception encountered while executing image OCR", err);
+    throw new Error(err.message || "Error processing image OCR");
   }
 };
 
@@ -1119,6 +1229,7 @@ app.post("/uploadExtract", upload.array("files"), async (req, res) => {
 
     // Prepare initial Firestore document with queued status
     const translationData = {
+      rating: 0,
       active: true,
       userUID: db.doc(`users/${userUID}`),
       files: [],
@@ -1193,10 +1304,49 @@ app.post("/uploadExtract", upload.array("files"), async (req, res) => {
               file,
               userUID,
               storageDir,
-              bucket
+              bucket,
+              incLanguage // Pass the language code here
             );
           } else {
             throw new Error("Unsupported file type");
+          }
+
+          const fileExtension = file.originalname
+            .split(".")
+            .pop()
+            .toLowerCase();
+
+          // Determine the file type based on mimeType
+          let fileType = "";
+          if (
+            [
+              "image/png",
+              "image/jpeg",
+              "image/bmp",
+              "image/pbm",
+              "image/webp",
+            ].includes(file.mimeType)
+          ) {
+            fileType = "image";
+          } else if (file.mimeType === "application/pdf") {
+            fileType = "pdf";
+          }
+
+          const fileData = {
+            filename: file.originalname,
+            rawFileName: file.originalname.substring(
+              file.originalname.indexOf("_") + 1
+            ),
+            originalFileUrl,
+            textFilePath: resultData.textFilePath,
+            textData: resultData.textData,
+            pageCount: resultData.pageCount,
+            fileExtension,
+            fileType,
+          };
+
+          if (resultData.zipFileUrl) {
+            fileData.zipFileUrl = resultData.zipFileUrl;
           }
 
           // Update Firestore document with processed file details
@@ -1204,15 +1354,7 @@ app.post("/uploadExtract", upload.array("files"), async (req, res) => {
             .collection("translations")
             .doc(translationRef.id)
             .update({
-              files: admin.firestore.FieldValue.arrayUnion({
-                filename: file.originalname,
-                rawFileName: file.originalname.split("_")[1],
-                originalFileUrl,
-                zipFileUrl: resultData.zipFileUrl,
-                textFilePath: resultData.textFilePath,
-                textData: resultData.textData,
-                pageCount: resultData.pageCount,
-              }),
+              files: admin.firestore.FieldValue.arrayUnion(fileData),
               totalPageCount: admin.firestore.FieldValue.increment(
                 resultData.pageCount || 0
               ),
@@ -1258,277 +1400,11 @@ app.post("/uploadExtract", upload.array("files"), async (req, res) => {
   }
 });
 
-processingQueue.process(async (job) => {
-  const { file, userUID, language, translationId } = job.data;
-  const storageDir = `translations/${userUID}`;
-  const originalFilePath = `${storageDir}/${file.originalname}`;
-  const originalFileRef = bucket.file(originalFilePath);
-
-  try {
-    // Save the file to Firebase Storage
-    await originalFileRef.save(file.buffer, { contentType: file.mimetype });
-    console.log("File uploaded successfully to Firebase Storage.");
-
-    const originalFileUrl = `https://storage.googleapis.com/${bucket.name}/${originalFilePath}`;
-    let resultData;
-
-    // Process based on file type
-    if (file.mimetype === "application/pdf") {
-      resultData = await processPDF(file, userUID, storageDir, bucket);
-    } else if (
-      [
-        "image/png",
-        "image/jpeg",
-        "image/bmp",
-        "image/pbm",
-        "image/webp",
-      ].includes(file.mimetype)
-    ) {
-      resultData = await processImageWithTesseract(
-        file,
-        userUID,
-        storageDir,
-        bucket
-      );
-    } else {
-      throw new Error("Unsupported file type");
-    }
-
-    // Update Firestore document with file processing details
-    const translationRef = db.collection("translations").doc(translationId);
-    await translationRef.update({
-      files: admin.firestore.FieldValue.arrayUnion({
-        filename: file.originalname,
-        rawFileName: file.originalname.split("_")[1],
-        originalFileUrl,
-        zipFileUrl: resultData.zipFileUrl,
-        textFilePath: resultData.textFilePath,
-        textData: resultData.textData,
-        pageCount: resultData.pageCount,
-      }),
-      totalPageCount: admin.firestore.FieldValue.increment(
-        resultData.pageCount || 0
-      ),
-      totalCharCount: admin.firestore.FieldValue.increment(
-        resultData.textData.charCountWithoutSpacesAndNumbers || 0
-      ),
-    });
-
-    const userDocRef = db.doc(`users/${userUID}`);
-    await db.runTransaction(async (transaction) => {
-      const userDoc = await transaction.get(userDocRef);
-      if (!userDoc.exists) {
-        throw new Error("User does not exist!");
-      }
-      const translations = userDoc.data().translations || [];
-      translations.push(translationRef);
-      transaction.update(userDocRef, { translations });
-    });
-
-    // Increment queueProgress.completedFiles for each successfully processed file
-    await translationRef.update({
-      "queueProgress.completedFiles": admin.firestore.FieldValue.increment(1),
-    });
-  } catch (error) {
-    console.error("Error processing file:", error);
-    await db.collection("translations").doc(translationId).update({
-      status: "failed",
-      active: false,
-      error: error.message,
-    });
-  }
-});
-
 //NEW WITH TASKS
 
 //NEW WITH TASKS
 
 //OLD
-
-app.post("/uploadExtractPDF2", upload.single("file"), async (req, res) => {
-  if (!req.file) {
-    console.log("No file uploaded");
-    return res.status(400).send("No file uploaded");
-  }
-
-  console.log("File received:");
-  console.log("Original filename:", req.file.originalname);
-  console.log("Mimetype:", req.file.mimetype);
-  console.log("File size:", req.file.size);
-  console.log("Buffer available:", !!req.file.buffer);
-
-  const userUID = req.file.originalname.split("_")[0];
-  if (!userUID || userUID.length === 0) {
-    console.log("Invalid or missing User UID");
-    return res.status(400).send("Invalid or missing User UID");
-  }
-
-  const storageDir = `translations/${userUID}`;
-
-  // Define the path for the original PDF file
-  const originalFilePath = `${storageDir}/${req.file.originalname}`;
-  const originalFile = bucket.file(originalFilePath);
-
-  // Upload the original PDF file to Firebase Storage
-  try {
-    await originalFile.save(req.file.buffer, {
-      contentType: req.file.mimetype,
-    });
-    console.log("Original PDF file uploaded successfully to Firebase Storage.");
-  } catch (err) {
-    console.error(
-      "Error uploading original PDF file to Firebase Storage:",
-      err
-    );
-    return res.status(500).send("Error uploading original PDF file");
-  }
-
-  try {
-    // Create a Service Principal for Adobe PDF services
-    const credentials = new ServicePrincipalCredentials({
-      clientId: process.env.PDF_SERVICES_CLIENT_ID,
-      clientSecret: process.env.PDF_SERVICES_CLIENT_SECRET,
-    });
-    const pdfServices = new PDFServices({ credentials });
-
-    // Create an asset(s) from the uploaded file using the readStream
-    const readStream = Readable.from(req.file.buffer);
-    const inputAsset = await pdfServices.upload({
-      readStream,
-      mimeType: MimeType.PDF,
-    });
-
-    // Create parameters for the job and execute the PDF extraction
-    const params = new ExtractPDFParams({
-      elementsToExtract: [ExtractElementType.TEXT],
-    });
-    const job = new ExtractPDFJob({ inputAsset, params });
-    const pollingURL = await pdfServices.submit({ job });
-    const pdfServicesResponse = await pdfServices.getJobResult({
-      pollingURL,
-      resultType: ExtractPDFResult,
-    });
-
-    // Extract the result's content
-    const resultAsset = pdfServicesResponse.result.resource;
-    const streamAsset = await pdfServices.getContent({ asset: resultAsset });
-
-    // Generate paths for saving files on Firebase Storage
-    //const storageDir = `translations/${userUID}`;
-    const zipFilePath = `${storageDir}/ExtractedText_${req.file.originalname}.zip`;
-
-    // Upload the zip file to Firebase Storage
-    const zipFile = bucket.file(zipFilePath);
-    const zipWriteStream = zipFile.createWriteStream({
-      metadata: { contentType: "application/zip" },
-    });
-
-    streamAsset.readStream.pipe(zipWriteStream);
-
-    zipWriteStream.on("finish", async () => {
-      console.log("ZIP file uploaded successfully to Firebase Storage.");
-
-      // Extract text from structuredData.json inside the ZIP file
-      const [metadata] = await zipFile.getMetadata();
-      const zipFileUrl = `https://storage.googleapis.com/${metadata.bucket}/${metadata.name}`;
-      const [zipBuffer] = await zipFile.download();
-
-      try {
-        const zip = new AdmZip(zipBuffer);
-
-        // Log all files inside the ZIP
-        zip.getEntries().forEach((entry) => {
-          console.log("File inside ZIP:", entry.entryName);
-        });
-
-        const jsonFile = zip.readAsText("structuredData.json");
-
-        if (!jsonFile) {
-          throw new Error("structuredData.json is missing or empty");
-        }
-
-        const jsonData = JSON.parse(jsonFile);
-
-        // Extract language and text data from JSON
-        const detectedLanguage = jsonData.extended_metadata.language;
-        const pagecount = jsonData.extended_metadata.page_count;
-
-        let fullText = jsonData.elements.reduce((acc, element) => {
-          return element.Text ? acc + " " + element.Text : acc;
-        }, "");
-
-        // Save the extracted text as a TXT file in Firebase Storage
-        const textFilePath = `${storageDir}/ExtractedText_${req.file.originalname}.txt`;
-        const textFile = bucket.file(textFilePath);
-        await textFile.save(fullText.trim(), {
-          contentType: "text/plain",
-        });
-
-        const pagesData = analyzePages(jsonData);
-
-        const originalFileUrl = `https://storage.googleapis.com/${bucket.name}/${originalFilePath}`;
-
-        const history = [];
-
-        const translationData = {
-          active: true,
-          userUID: db.doc(`users/${userUID}`),
-          filename: req.file.originalname,
-          rawFileName: req.file.originalname.split("_")[1],
-          originalFileUrl,
-          zipFileUrl,
-          textFilePath,
-          language: jsonData.extended_metadata.language,
-          pageCount: jsonData.extended_metadata.page_count,
-          pagesData: pagesData,
-          status: "waitingoffer",
-          createdAt: admin.firestore.Timestamp.now(),
-          history: [
-            {
-              timestamp: admin.firestore.Timestamp.now(),
-              description: "Dosya analiz için yüklendi",
-              hidden: false,
-            },
-          ],
-        };
-
-        // Save translation data to Firestore
-        const translationRef = await db
-          .collection("translations")
-          .add(translationData);
-
-        // Update user's translation array in Firestore
-        const userDocRef = db.doc(`users/${userUID}`);
-        await db.runTransaction(async (transaction) => {
-          const userDoc = await transaction.get(userDocRef);
-          if (!userDoc.exists) {
-            throw new Error("User does not exist!");
-          }
-          const translations = userDoc.data().translations || [];
-          translations.push(translationRef);
-          transaction.update(userDocRef, { translations });
-        });
-
-        res.status(200).json({
-          message: "File uploaded and processed successfully",
-          translationID: translationRef.id,
-          language: detectedLanguage,
-        });
-      } catch (err) {
-        console.error("Error parsing structuredData.json:", err);
-        return res.status(500).send("Error processing ZIP file contents");
-      }
-    });
-
-    zipWriteStream.on("error", (err) => {
-      console.error("Error writing the ZIP file to Firebase Storage", err);
-      res.status(500).send("Error writing the ZIP file");
-    });
-  } catch (err) {
-    console.error("Exception encountered while executing operation", err);
-    res.status(500).send("Error processing PDF extraction");
-  }
-});
 
 //OLD
 
@@ -2318,11 +2194,11 @@ app.post("/goToPayment", async (req, res) => {
         //finalamount = finalamount + depolamaPrice;
 
         console.log(
-          `Depolama servisi eklendi: ${depolamaOpt} ay ${depolamaPrice}₺`
+          `Depolama servisi eklendi: ${depolamaOpt} ay ${depolamaPrice} ₺`
         );
 
         newHistoryEntries.push({
-          description: `Depolama servisi eklendi: ${depolamaOpt} ay ${depolamaPrice}₺`,
+          description: `Depolama servisi eklendi: ${depolamaOpt} ay ${depolamaPrice} ₺`,
           hidden: false,
           timestamp: admin.firestore.Timestamp.now(),
         });
@@ -2350,10 +2226,10 @@ app.post("/goToPayment", async (req, res) => {
         acilPrice = acilData[acilOpt];
         //finalamount = finalamount + acilPrice;
 
-        console.log(`Acil servisi eklendi: ${acilOpt} saat ${acilPrice}₺`);
+        console.log(`Acil servisi eklendi: ${acilOpt} saat ${acilPrice} ₺`);
 
         newHistoryEntries.push({
-          description: `Acil servisi eklendi: ${acilOpt} saat ${acilPrice}₺`,
+          description: `Acil servisi eklendi: ${acilOpt} saat ${acilPrice} ₺`,
           hidden: false,
           timestamp: admin.firestore.Timestamp.now(),
         });
@@ -2727,22 +2603,22 @@ app.post("/recalculate", async (req, res) => {
     finalamount = parseFloat(finalamount.toFixed(2));
 
     // Create history entry in Turkish
-    let historyDescription = `Çeviri güncellendi. Yeni fiyat: ${finalamount} TL. `;
-    historyDescription += `Karakter Ücreti: ${karakterUcreti.toFixed(2)} TL, `;
+    let historyDescription = `Çeviri güncellendi. Yeni fiyat: ${finalamount} ₺. `;
+    historyDescription += `Karakter Ücreti: ${karakterUcreti.toFixed(2)} ₺, `;
     if (noterUcreti > 0) {
-      historyDescription += `Noter Ücreti: ${noterUcreti.toFixed(2)} TL, `;
+      historyDescription += `Noter Ücreti: ${noterUcreti.toFixed(2)} ₺, `;
     }
     if (toplamOnayUcreti > 0) {
       historyDescription += `Onay Ücretleri: ${toplamOnayUcreti.toFixed(
         2
-      )} TL, `;
+      )} ₺, `;
     }
     if (indirimTutari > 0) {
       historyDescription += `İndirim Tutarı (${discount}%): ${indirimTutari.toFixed(
         2
-      )} TL, `;
+      )} ₺, `;
     }
-    historyDescription += `KDV (%${KDV * 100}): ${KDVUcreti.toFixed(2)} TL.`;
+    historyDescription += `KDV (%${KDV * 100}): ${KDVUcreti.toFixed(2)} ₺.`;
 
     const newHistoryEntry = {
       timestamp: admin.firestore.Timestamp.now(),
@@ -3293,21 +3169,21 @@ app.post("/getoffer", async (req, res) => {
 
       //sendTeklifOnayMail(offerData.translationID, true, finalamount);
     } else {
-      let historyString = `Karakter Ücreti: ${karakterUcreti} TL`;
+      let historyString = `Karakter Ücreti: ${karakterUcreti} ₺`;
 
       if (toplamOnayUcreti > 0) {
-        historyString += `, Onay Ücretleri (Noter harici): ${toplamOnayUcreti} TL`;
+        historyString += `, Onay Ücretleri (Noter harici): ${toplamOnayUcreti} ₺`;
       }
 
       if (noterUcreti > 0) {
-        historyString += `, Tahmini Noter Ücreti: ${noterUcreti} TL`;
+        historyString += `, Tahmini Noter Ücreti: ${noterUcreti} ₺`;
       }
 
       if (indirimTutari > 0) {
-        historyString += `, İndirim Tutarı(${discount}%): ${indirimTutari} TL`;
+        historyString += `, İndirim Tutarı(${discount}%): ${indirimTutari} ₺`;
       }
 
-      historyString += `, KDV(20%): ${KDVUcreti} TL teklif alındı.`;
+      historyString += `, KDV(20%): ${KDVUcreti} ₺ teklif alındı.`;
 
       console.log(historyString);
       newHistoryEntry = {
@@ -3447,13 +3323,13 @@ app.post("/updateNoterPrice", async (req, res) => {
       translationID
     );
     console.log(
-      `Noter maili gönderildi: IBAN ${iban}, alıcı ${userEmail}, tutar ${noterUcreti} TL`
+      `Noter maili gönderildi: IBAN ${iban}, alıcı ${userEmail}, tutar ${noterUcreti} ₺`
     );
 
     // Creating history entry
     let historyString = `Noter Ücreti ${noterUcreti.toFixed(
       2
-    )} TL olarak güncellendi ve kullanıcıya e-posta gönderildi.`;
+    )} ₺ olarak güncellendi ve kullanıcıya e-posta gönderildi.`;
 
     console.log(historyString);
 
@@ -3603,27 +3479,27 @@ app.post("/updateCharPrice", async (req, res) => {
     // Creating history entry
     let historyString = `Teklif, Karakter Ücreti: ${karakterUcreti.toFixed(
       2
-    )} TL`;
+    )} ₺`;
 
     if (toplamOnayUcreti > 0) {
       historyString += `, Onay Ücretleri (Noter harici): ${toplamOnayUcreti.toFixed(
         2
-      )} TL`;
+      )} ₺`;
     }
 
     if (noterUcreti > 0) {
-      historyString += `, Tahmini Noter Ücreti: ${noterUcreti.toFixed(2)} TL`;
+      historyString += `, Tahmini Noter Ücreti: ${noterUcreti.toFixed(2)} ₺`;
     }
 
     if (indirimTutari > 0) {
       historyString += `, İndirim Tutarı(${discount}%): ${indirimTutari.toFixed(
         2
-      )} TL`;
+      )} ₺`;
     }
 
     historyString += `, KDV(20%): ${KDVUcreti.toFixed(
       2
-    )} TL olarak güncellendi.`;
+    )} ₺ olarak güncellendi.`;
 
     console.log(historyString);
 
@@ -3945,99 +3821,6 @@ app.post("/uploadExtractPDF", upload.single("file"), async (req, res) => {
   }
 });
 
-// OCR endpoint to upload a PDF and perform OCR using Adobe API
-app.post("/uploadOCR", upload.single("file"), async (req, res) => {
-  const userUID = req.file.originalname.split("_")[0];
-
-  console.log("UserUID: ", userUID);
-
-  // Check if file was uploaded
-  if (!req.file) {
-    console.log("No file uploaded");
-    return res.status(400).send("No file uploaded");
-  }
-
-  // Ensure userUID is provided
-  if (!userUID) {
-    console.log("User UID is missing");
-    return res.status(400).send("User UID is missing");
-  }
-
-  const filePath = req.file.path;
-
-  try {
-    // Initial setup, create credentials instance
-    const credentials = new ServicePrincipalCredentials({
-      clientId: process.env.PDF_SERVICES_CLIENT_ID,
-      clientSecret: process.env.PDF_SERVICES_CLIENT_SECRET,
-    });
-
-    // Creates a PDF Services instance
-    const pdfServices = new PDFServices({ credentials });
-
-    // Creates an asset(s) from source file(s) and upload
-    const readStream = fs.createReadStream(filePath);
-    const inputAsset = await pdfServices.upload({
-      readStream,
-      mimeType: MimeType.PDF,
-    });
-
-    const params = new OCRParams({
-      ocrLocale: OCRSupportedLocale.TR_TR,
-      ocrType: OCRSupportedType.SEARCHABLE_IMAGE_EXACT,
-    });
-
-    // Creates a new job instance
-    const job = new OCRJob({ inputAsset, params });
-
-    // Submit the job and get the job result
-    const pollingURL = await pdfServices.submit({ job });
-    const pdfServicesResponse = await pdfServices.getJobResult({
-      pollingURL,
-      resultType: OCRResult,
-    });
-
-    // Get content from the resulting asset(s)
-    const resultAsset = pdfServicesResponse.result.asset;
-    const streamAsset = await pdfServices.getContent({ asset: resultAsset });
-
-    // Create the output directory if it doesn't exist
-    const outputDir = path.join(__dirname, "uploads", userUID, "translations");
-    if (!fs.existsSync(outputDir)) {
-      fs.mkdirSync(outputDir, { recursive: true });
-    }
-
-    // Creates a write stream and copy stream asset's content to it
-    const outputFilePath = path.join(outputDir, `OCR_${req.file.filename}`);
-    console.log(`Saving asset at ${outputFilePath}`);
-
-    const writeStream = fs.createWriteStream(outputFilePath);
-    streamAsset.readStream.pipe(writeStream);
-
-    writeStream.on("finish", () => {
-      console.log("File saved successfully.");
-      res.status(200).send(`OCR file saved successfully: ${outputFilePath}`);
-    });
-
-    writeStream.on("error", (err) => {
-      console.error("Error writing the file", err);
-      res.status(500).send("Error writing the file");
-    });
-  } catch (err) {
-    if (
-      err instanceof SDKError ||
-      err instanceof ServiceUsageError ||
-      err instanceof ServiceApiError
-    ) {
-      console.log("Exception encountered while executing operation", err);
-      res.status(500).send("Error processing OCR");
-    } else {
-      console.log("Exception encountered while executing operation", err);
-      res.status(500).send("Error processing OCR");
-    }
-  }
-});
-
 // Test endpoint to check Firestore connection
 app.get("/firestoreTest", async (req, res) => {
   const testDocRef = db.collection("testCollection").doc("testDoc");
@@ -4148,6 +3931,7 @@ app.post("/register", async (req, res) => {
       userType: finalUserType,
       profilePicUrl: defaultProfilePicUrl,
       countryCode: countryCode,
+      status: "available",
     };
 
     if (discount > 0) {
